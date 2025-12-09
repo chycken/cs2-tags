@@ -1,0 +1,39 @@
+[Tags.settings]
+Tag = "[red][Tags] "
+DeadName = "☠"
+
+NonePrefixName = ""
+TPrefixName = ""
+CTPrefixName = ""
+SpecPrefixName = "*SPEC*"
+
+NoneTeamChatName = "[white](Team)"
+SpecTeamChatName = "[purple](Team)"
+TTeamChatName = "[yellow](Team)"
+CTTeamChatName = "[blue](Team)"
+
+[Tags.commands]
+TagsReload = [ "tags_reload" ]
+Visibility = [ "tags_toggletags", "tags_visibility" ]
+
+[Tags.default]
+ScoreTag = ""
+ChatTag = "[grey][Player]"
+ChatColor = "[white]"
+NameColor = "[teamcolor]"
+ChatSound = true
+
+[[Tags.Tags]]
+Role = "76561199165718810"
+ScoreTag = ""
+ChatTag = "[red][schwarper] "
+ChatColor = "[green]"
+NameColor = "[teamcolor]"
+ChatSound = false
+
+[[Tags.Tags]]
+Role = "#OWNER"
+ScoreTag = ""
+ChatTag = "[red][OWNER] "
+ChatColor = "[green]"
+NameColor = "[teamcolor]"
