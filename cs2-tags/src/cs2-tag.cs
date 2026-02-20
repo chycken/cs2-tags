@@ -32,6 +32,10 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
     private const float ApplyRetryDelaySeconds = 0.2f;
     private static readonly TimeSpan PermissionWarmupWindow = TimeSpan.FromSeconds(40);
 
+    // periodic revalidation so tag updates when permissions are removed/expired
+    private const float RevalidateIntervalSeconds = 1.0f;
+    private static bool _revalidateLoopEnabled;
+
     public override void Load(bool hotReload)
     {
         Instance = Core;
@@ -64,6 +68,10 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         // Align with Shop_Flags (it applies permissions on world update)
         Core.Scheduler.NextWorldUpdate(() => ReloadTags());
 
+        // start periodic permission->tag revalidation loop
+        _revalidateLoopEnabled = true;
+        ScheduleRevalidateLoop();
+
         if (hotReload)
             ReloadTags();
     }
@@ -75,9 +83,44 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
 
     public override void Unload()
     {
-        // no handlers to remove (attributes are auto)
+        _revalidateLoopEnabled = false;
+
         PlayerTagsList.Clear();
         PlayerJoinUtc.Clear();
+    }
+
+    private static void ScheduleRevalidateLoop()
+    {
+        if (!_revalidateLoopEnabled || Instance == null)
+            return;
+
+        Instance.Scheduler.DelayBySeconds(RevalidateIntervalSeconds, () =>
+        {
+            if (!_revalidateLoopEnabled || Instance == null)
+                return;
+
+            Instance.Scheduler.NextWorldUpdate(() =>
+            {
+                if (!_revalidateLoopEnabled || Instance == null)
+                    return;
+
+                RevalidateAllPlayers();
+                ScheduleRevalidateLoop();
+            });
+        });
+    }
+
+    private static void RevalidateAllPlayers()
+    {
+        var players = Instance.PlayerManager.GetAllPlayers();
+        foreach (var player in players)
+        {
+            if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
+                continue;
+
+            // update tag immediately when permissions disappear, without reconnect
+            player.RevalidateTagFromPermissions();
+        }
     }
 
     public static void Command_Tags_Reload(ICommandContext context)
@@ -120,6 +163,7 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         // don't lock-in default tag
         PlayerTagsList.Remove(player.SteamID);
 
+        // attempt apply early, retry on world update (ShopCore async)
         ScheduleApplyAttemptWorld(player, attempt: 1, force: true);
 
         return HookResult.Continue;
@@ -146,6 +190,20 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
             return HookResult.Continue;
 
         ScheduleApplyAttemptWorld(player, attempt: 1, force: false);
+        return HookResult.Continue;
+    }
+
+    // ✅ NEW: apply tag immediately when the player joins/switches team (no need to wait for next round/spawn)
+    [GameEventHandler(HookMode.Post)]
+    public HookResult OnPlayerTeam(EventPlayerTeam @event)
+    {
+        if (@event.UserIdPlayer is not IPlayer player)
+            return HookResult.Continue;
+
+        if (player.IsFakeClient || player.SteamID == 0)
+            return HookResult.Continue;
+
+        ScheduleApplyAttemptWorld(player, attempt: 1, force: true);
         return HookResult.Continue;
     }
 
@@ -178,7 +236,10 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         }
 
         var tag = GetOrCreatePlayerTag(player, force);
-        player.SetScoreTag(tag.ScoreTag);
+
+        // Respect visibility (hide -> default scoretag)
+        player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
+
         return true;
     }
 
