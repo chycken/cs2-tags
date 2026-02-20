@@ -313,3 +313,4 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         return HookResult.Continue;
     }
 }
+ 
