@@ -27,14 +27,17 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
     public static readonly TagsAPI Api = new();
     public static Config Config { get; set; } = null!;
 
-    // Shop_Flags / async player item load tolerance
-    private const int ApplyMaxAttempts = 200;          // 200 * 0.2s = 40s
-    private const float ApplyRetryDelaySeconds = 0.2f;
+    // Warmup window for async permission loaders (ShopCore, etc.)
     private static readonly TimeSpan PermissionWarmupWindow = TimeSpan.FromSeconds(40);
 
-    // periodic revalidation so tag updates when permissions are removed/expired
-    private const float RevalidateIntervalSeconds = 1.0f;
-    private static bool _revalidateLoopEnabled;
+    // ULTRA-LITE: only 3 attempts, fixed delays (no 200x recursion)
+    private static readonly float[] ApplyDelaysSeconds = new float[] { 0.0f, 1.0f, 6.0f };
+
+    // Prebuilt indexes to avoid scanning Config.Tags constantly
+    private static readonly Dictionary<ulong, Tag> _steamIdIndex = new();
+    private static readonly List<RoleTagEntry> _roleIndex = new();
+
+    public readonly record struct RoleTagEntry(string Role, Tag Tag);
 
     public override void Load(bool hotReload)
     {
@@ -57,82 +60,70 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         var provider = services.BuildServiceProvider();
         Config = provider.GetRequiredService<IOptions<Config>>().Value;
 
-        foreach (string command in Config.Commands.TagsReload)
+        foreach (var command in Config.Commands.TagsReload)
             Core.Command.RegisterCommand(command, Command_Tags_Reload, true, "tags.reload");
 
-        foreach (string command in Config.Commands.Visibility)
+        foreach (var command in Config.Commands.Visibility)
             Core.Command.RegisterCommand(command, Command_Visibility, true, "tags.visibility");
 
         Tags.Config.Settings.Init();
+        BuildTagIndexes();
 
-        // Align with Shop_Flags (it applies permissions on world update)
+        // Align with permission loaders (world update)
         Core.Scheduler.NextWorldUpdate(() => ReloadTags());
-
-        // start periodic permission->tag revalidation loop
-        _revalidateLoopEnabled = true;
-        ScheduleRevalidateLoop();
 
         if (hotReload)
             ReloadTags();
     }
 
     public override void ConfigureSharedInterface(IInterfaceManager interfaceManager)
-    {
-        interfaceManager.AddSharedInterface<ITagApi, TagsAPI>("Tags.Api", Api);
-    }
+        => interfaceManager.AddSharedInterface<ITagApi, TagsAPI>("Tags.Api", Api);
 
     public override void Unload()
     {
-        _revalidateLoopEnabled = false;
-
         PlayerTagsList.Clear();
         PlayerJoinUtc.Clear();
+        _steamIdIndex.Clear();
+        _roleIndex.Clear();
     }
 
-    private static void ScheduleRevalidateLoop()
+    // Build indexes (steamid -> tag, role -> tag)
+    private static void BuildTagIndexes()
     {
-        if (!_revalidateLoopEnabled || Instance == null)
-            return;
+        _steamIdIndex.Clear();
+        _roleIndex.Clear();
 
-        Instance.Scheduler.DelayBySeconds(RevalidateIntervalSeconds, () =>
+        foreach (var t in Config.Tags)
         {
-            if (!_revalidateLoopEnabled || Instance == null)
-                return;
-
-            Instance.Scheduler.NextWorldUpdate(() =>
-            {
-                if (!_revalidateLoopEnabled || Instance == null)
-                    return;
-
-                RevalidateAllPlayers();
-                ScheduleRevalidateLoop();
-            });
-        });
-    }
-
-    private static void RevalidateAllPlayers()
-    {
-        var players = Instance.PlayerManager.GetAllPlayers();
-        foreach (var player in players)
-        {
-            if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
+            if (string.IsNullOrWhiteSpace(t.Role))
                 continue;
 
-            // update tag immediately when permissions disappear, without reconnect
-            player.RevalidateTagFromPermissions();
+            // If role is numeric steamid -> direct index
+            if (ulong.TryParse(t.Role, out var sid) && sid != 0)
+            {
+                _steamIdIndex[sid] = t.Clone();
+                continue;
+            }
+
+            // Otherwise treat it as permission role string
+            _roleIndex.Add(new RoleTagEntry(t.Role, t.Clone()));
         }
     }
+
+    // Exposed to TagExtensions (ultra-lite lookup)
+    public static bool TryGetSteamIdTag(ulong steamId, out Tag tag) => _steamIdIndex.TryGetValue(steamId, out tag!);
+    public static IReadOnlyList<RoleTagEntry> GetRoleTagIndex() => _roleIndex;
 
     public static void Command_Tags_Reload(ICommandContext context)
     {
         ReloadConfig();
+        BuildTagIndexes();
         ReloadTags();
     }
 
     public void Command_Visibility(ICommandContext context)
     {
-        if (!context.IsSentByPlayer)
-            return;
+        if (!context.IsSentByPlayer) return;
 
         var player = context.Sender!;
         var localizer = Core.Translation.GetPlayerLocalizer(player);
@@ -152,28 +143,20 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerConnect(EventPlayerConnectFull @event)
     {
-        if (@event.UserIdPlayer is not IPlayer player)
-            return HookResult.Continue;
-
-        if (player.IsFakeClient || player.SteamID == 0)
-            return HookResult.Continue;
+        if (@event.UserIdPlayer is not IPlayer player) return HookResult.Continue;
+        if (player.IsFakeClient || player.SteamID == 0) return HookResult.Continue;
 
         PlayerJoinUtc[player.SteamID] = DateTime.UtcNow;
-
-        // don't lock-in default tag
         PlayerTagsList.Remove(player.SteamID);
 
-        // attempt apply early, retry on world update (ShopCore async)
-        ScheduleApplyAttemptWorld(player, attempt: 1, force: true);
-
+        ScheduleApplyLite(player, force: true);
         return HookResult.Continue;
     }
 
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerDisconnect(EventPlayerDisconnect @event)
     {
-        if (@event.UserIdPlayer is not IPlayer player)
-            return HookResult.Continue;
+        if (@event.UserIdPlayer is not IPlayer player) return HookResult.Continue;
 
         PlayerTagsList.Remove(player.SteamID);
         PlayerJoinUtc.Remove(player.SteamID);
@@ -183,45 +166,40 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerSpawn(EventPlayerSpawn @event)
     {
-        if (@event.UserIdPlayer is not { } player)
-            return HookResult.Continue;
+        if (@event.UserIdPlayer is not { } player) return HookResult.Continue;
+        if (player.IsFakeClient || player.SteamID == 0) return HookResult.Continue;
 
-        if (player.IsFakeClient || player.SteamID == 0)
-            return HookResult.Continue;
-
-        ScheduleApplyAttemptWorld(player, attempt: 1, force: false);
+        ScheduleApplyLite(player, force: false);
         return HookResult.Continue;
     }
 
-    // ✅ NEW: apply tag immediately when the player joins/switches team (no need to wait for next round/spawn)
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerTeam(EventPlayerTeam @event)
     {
-        if (@event.UserIdPlayer is not IPlayer player)
-            return HookResult.Continue;
+        if (@event.UserIdPlayer is not IPlayer player) return HookResult.Continue;
+        if (player.IsFakeClient || player.SteamID == 0) return HookResult.Continue;
 
-        if (player.IsFakeClient || player.SteamID == 0)
-            return HookResult.Continue;
-
-        ScheduleApplyAttemptWorld(player, attempt: 1, force: true);
+        ScheduleApplyLite(player, force: true);
         return HookResult.Continue;
     }
 
-    private static void ScheduleApplyAttemptWorld(IPlayer player, int attempt, bool force)
+    // ULTRA-LITE apply: 3 attempts with fixed delays, no recursion storm
+    private static void ScheduleApplyLite(IPlayer player, bool force)
     {
-        Instance.Scheduler.NextWorldUpdate(() =>
+        for (int i = 0; i < ApplyDelaysSeconds.Length; i++)
         {
-            if (TryApplyTag(player, force))
-                return;
+            float delay = ApplyDelaysSeconds[i];
 
-            if (attempt >= ApplyMaxAttempts)
-                return;
+            if (delay <= 0.001f)
+            {
+                Instance.Scheduler.NextWorldUpdate(() => TryApplyTag(player, force));
+                continue;
+            }
 
-            Instance.Scheduler.DelayBySeconds(
-                ApplyRetryDelaySeconds,
-                () => ScheduleApplyAttemptWorld(player, attempt + 1, force: true)
+            Instance.Scheduler.DelayBySeconds(delay, () =>
+                Instance.Scheduler.NextWorldUpdate(() => TryApplyTag(player, force: true))
             );
-        });
+        }
     }
 
     private static bool TryApplyTag(IPlayer player, bool force)
@@ -236,10 +214,7 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         }
 
         var tag = GetOrCreatePlayerTag(player, force);
-
-        // Respect visibility (hide -> default scoretag)
         player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
-
         return true;
     }
 
@@ -277,7 +252,7 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         if (string.IsNullOrEmpty(messageProcess.Message))
             return HookResult.Handled;
 
-        HookResult hookResult = Api.MessageProcessPre(messageProcess);
+        var hookResult = Api.MessageProcessPre(messageProcess);
         if (hookResult >= HookResult.Stop)
             return hookResult;
 
@@ -288,9 +263,9 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
 
         string teamname = messageProcess.TeamMessage ? player.Controller.Team.Name() : string.Empty;
 
-        Tag playerData = messageProcess.Tag;
+        var playerData = messageProcess.Tag;
+        var team = player.Controller.Team;
 
-        Team team = player.Controller.Team;
         messageProcess.PlayerName = FormatMessage(
             team,
             prefixname,
@@ -313,4 +288,3 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         return HookResult.Continue;
     }
 }
- 
