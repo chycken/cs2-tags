@@ -229,18 +229,31 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
             return false;
 
+        if (player.Controller == null || !player.Controller.IsValid)
+            return false;
+
         if (PlayerJoinUtc.TryGetValue(player.SteamID, out var joinedUtc))
         {
             if ((DateTime.UtcNow - joinedUtc) <= PermissionWarmupWindow)
                 force = true;
         }
 
-        var tag = GetOrCreatePlayerTag(player, force);
+        try
+        {
+            var tag = GetOrCreatePlayerTag(player, force);
 
-        // Respect visibility (hide -> default scoretag)
-        player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
-
-        return true;
+            // Respect visibility (hide -> default scoretag)
+            player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     [ServerNetMessageHandler]
@@ -313,4 +326,3 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         return HookResult.Continue;
     }
 }
- 
