@@ -18,7 +18,7 @@ using static TagsApi.Tags;
 
 namespace Tags;
 
-[PluginMetadata(Id = "Tags", Version = "v1", Name = "Tags", Author = "schwarper")]
+[PluginMetadata(Id = "Tags", Version = "v1", Name = "Tags", Author = "schwarper, chickender")]
 public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
 {
     public static ISwiftlyCore Instance { get; set; } = null!;
@@ -226,21 +226,31 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
 
     private static bool TryApplyTag(IPlayer player, bool force)
     {
-        if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
-            return false;
-
-        if (PlayerJoinUtc.TryGetValue(player.SteamID, out var joinedUtc))
+        try
         {
-            if ((DateTime.UtcNow - joinedUtc) <= PermissionWarmupWindow)
-                force = true;
+            if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
+                return false;
+
+            if (player.Controller == null || !player.Controller.IsValid)
+                return false;
+
+            if (PlayerJoinUtc.TryGetValue(player.SteamID, out var joinedUtc))
+            {
+                if ((DateTime.UtcNow - joinedUtc) <= PermissionWarmupWindow)
+                    force = true;
+            }
+
+            var tag = GetOrCreatePlayerTag(player, force);
+
+            // Respect visibility (hide -> default scoretag)
+            player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
+            return true;
         }
-
-        var tag = GetOrCreatePlayerTag(player, force);
-
-        // Respect visibility (hide -> default scoretag)
-        player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
-
-        return true;
+        catch (Exception)
+        {
+            // Elcsíp mindent (pl. ClearScoreTag / CCSPlayerControllerImpl.get_Clan null schema hibát)
+            return false;
+        }
     }
 
     [ServerNetMessageHandler]
@@ -313,4 +323,3 @@ public sealed class Tags(ISwiftlyCore core) : BasePlugin(core)
         return HookResult.Continue;
     }
 }
- 
