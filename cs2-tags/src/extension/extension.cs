@@ -13,6 +13,8 @@ namespace Tags;
 
 public static partial class TagExtensions
 {
+    public static readonly Dictionary<ulong, Tag> PlayerTagsList = [];
+
     [GeneratedRegex(@"\{.*?\}|\p{C}")]
     private static partial Regex MyRegex();
 
@@ -75,69 +77,31 @@ public static partial class TagExtensions
             && tag.Visibility == d.Visibility;
     }
 
-    private static bool TagContentEquals(Tag a, Tag b)
-    {
-        return string.Equals(a.ScoreTag ?? "", b.ScoreTag ?? "", StringComparison.Ordinal)
-            && string.Equals(a.ChatTag ?? "", b.ChatTag ?? "", StringComparison.Ordinal)
-            && string.Equals(a.NameColor ?? "", b.NameColor ?? "", StringComparison.Ordinal)
-            && string.Equals(a.ChatColor ?? "", b.ChatColor ?? "", StringComparison.Ordinal);
-    }
-
-    private static Tag MergeUserPrefs(Tag baseTag, Tag? oldTag)
-    {
-        if (oldTag == null)
-            return baseTag;
-
-        baseTag.ChatSound = oldTag.ChatSound;
-        baseTag.Visibility = oldTag.Visibility;
-        return baseTag;
-    }
-
-    // NEW: called periodically from Tags.cs to instantly react to permission removal/expiry
-    public static void RevalidateTagFromPermissions(this IPlayer player)
-    {
-        if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
-            return;
-
-        PlayerTagsList.TryGetValue(player.SteamID, out var cached);
-
-        // Compute current tag based on current permissions/config
-        var computed = player.GetTag();
-        computed = MergeUserPrefs(computed, cached);
-
-        // If we have a cached tag and content hasn't changed, do nothing
-        if (cached != null && TagContentEquals(cached, computed))
-            return;
-
-        // Update cache policy: keep non-default cached, avoid locking default (as before)
-        if (IsDefaultTag(computed))
-            PlayerTagsList.Remove(player.SteamID);
-        else
-            PlayerTagsList[player.SteamID] = computed;
-
-        // Apply scoretag immediately (respect visibility)
-        player.SetScoreTag(player.GetVisibility() ? computed.ScoreTag : Tags.Config.Default.ScoreTag);
-    }
-
-    public static Tag GetOrCreatePlayerTag(IPlayer player, bool force)
+    public static Tag GetOrCreatePlayerTag(IPlayer player, bool force = false)
     {
         if (player == null)
             return Tags.Config.Default.Clone();
 
-        if (!force && PlayerTagsList.TryGetValue(player.SteamID, out Tag? cachedTag) && cachedTag != null)
-            return cachedTag;
-
-        Tag newTag = player.GetTag();
-
-        // Never cache default: allows late permissions (ShopCore async load) to flip tag later.
-        if (IsDefaultTag(newTag))
+        try
         {
-            PlayerTagsList.Remove(player.SteamID);
-            return newTag;
-        }
+            // Mindig élőben lekérdjük a legfrissebb taget a jogok alapján, így azonnal reagál a flag elvesztésére
+            Tag freshTag = player.GetTag();
 
-        PlayerTagsList[player.SteamID] = newTag;
-        return newTag;
+            if (!IsDefaultTag(freshTag))
+            {
+                PlayerTagsList[player.SteamID] = freshTag;
+                return freshTag;
+            }
+            else
+            {
+                PlayerTagsList.Remove(player.SteamID);
+                return Tags.Config.Default.Clone();
+            }
+        }
+        catch
+        {
+            return Tags.Config.Default.Clone();
+        }
     }
 
     public static Tag GetTag(this IPlayer player)
@@ -145,24 +109,31 @@ public static partial class TagExtensions
         if (player == null)
             return Tags.Config.Default.Clone();
 
-        string steamId = player.SteamID.ToString();
+        try
+        {
+            string steamId = player.SteamID.ToString();
 
-        Tag? steamIdTag = Tags.Config.Tags
-            .FirstOrDefault(t => string.Equals(t.Role, steamId, StringComparison.Ordinal))?.Clone();
+            Tag? steamIdTag = Tags.Config.Tags
+                .FirstOrDefault(t => string.Equals(t.Role, steamId, StringComparison.Ordinal))?.Clone();
 
-        if (steamIdTag != null)
-            return steamIdTag;
+            if (steamIdTag != null)
+                return steamIdTag;
 
-        if (Tags.Instance?.Permission == null)
+            if (Tags.Instance?.Permission == null)
+                return Tags.Config.Default.Clone();
+
+            Tag? permTag = Tags.Config.Tags
+                .Where(t => !string.IsNullOrWhiteSpace(t.Role)
+                            && Tags.Instance.Permission.PlayerHasPermission(player.SteamID, t.Role))
+                .Select(t => t.Clone())
+                .FirstOrDefault();
+
+            return permTag ?? Tags.Config.Default.Clone();
+        }
+        catch
+        {
             return Tags.Config.Default.Clone();
-
-        Tag? permTag = Tags.Config.Tags
-            .Where(t => !string.IsNullOrWhiteSpace(t.Role)
-                        && Tags.Instance.Permission.PlayerHasPermission(player.SteamID, t.Role))
-            .Select(t => t.Clone())
-            .FirstOrDefault();
-
-        return permTag ?? Tags.Config.Default.Clone();
+        }
     }
 
     public static string GetPrePostValue(TagPrePost prePost, string? oldValue, string newValue)
@@ -244,15 +215,19 @@ public static partial class TagExtensions
         }
         if ((types & TagType.ChatTag) != 0) tag.ChatTag = defaultTag.ChatTag;
         if ((types & TagType.NameColor) != 0) tag.NameColor = defaultTag.NameColor;
-        if ((types & TagType.ChatColor) != 0) tag.ChatColor = defaultTag.ChatColor;
+        if ((types & TagType.ChatColor) != 0) tag.ChatColor = defaultTag.ChatTag;
 
         Tags.Api.TagsUpdatedPost(player, tag);
     }
 
     public static bool GetChatSound(this IPlayer player)
     {
-        if (PlayerTagsList.TryGetValue(player.SteamID, out Tag? tag))
-            return tag.ChatSound;
+        try
+        {
+            if (PlayerTagsList.TryGetValue(player.SteamID, out Tag? tag))
+                return tag.ChatSound;
+        }
+        catch {}
 
         return GetOrCreatePlayerTag(player, true).ChatSound;
     }
@@ -267,8 +242,12 @@ public static partial class TagExtensions
 
     public static bool GetVisibility(this IPlayer player)
     {
-        if (PlayerTagsList.TryGetValue(player.SteamID, out Tag? tag))
-            return tag.Visibility;
+        try
+        {
+            if (PlayerTagsList.TryGetValue(player.SteamID, out Tag? tag))
+                return tag.Visibility;
+        }
+        catch {}
 
         return GetOrCreatePlayerTag(player, true).Visibility;
     }
@@ -284,50 +263,21 @@ public static partial class TagExtensions
         Tags.Api.TagsUpdatedPost(player, tag);
     }
 
-    // Scoreboard refresh fix (immediate)
     public static void SetScoreTag(this IPlayer player, string? tag)
     {
-        if (player == null || !player.IsValid)
+        if (player == null || !player.IsValid || player.Controller == null || !player.Controller.IsValid)
             return;
 
         string normalizedTag = tag ?? string.Empty;
-        if (normalizedTag.Length == 0)
-        {
-            ClearScoreTag(player);
-            return;
-        }
 
-        if (player.Controller.Clan != normalizedTag)
+        try
+        {
             player.Controller.Clan = normalizedTag;
-
-        player.Controller.ClanUpdated();
-        FireScoreTagRefreshEvent(player);
-    }
-
-    private static void ClearScoreTag(IPlayer player)
-    {
-        if (player == null || !player.IsValid)
-            return;
-
-        if (player.Controller.Clan != string.Empty)
-            player.Controller.Clan = string.Empty;
-
-        player.Controller.ClanUpdated();
-        FireScoreTagRefreshEvent(player);
-    }
-
-    private static void FireScoreTagRefreshEvent(IPlayer player)
-    {
-        if (Instance == null || player == null || !player.IsValid)
-            return;
-
-        Instance.Scheduler.NextWorldUpdate(() =>
+            player.Controller.ClanUpdated();
+        }
+        catch
         {
-            if (player == null || !player.IsValid)
-                return;
-
-            Instance.GameEvent.Fire<EventNextlevelChanged>();
-        });
+        }
     }
 
     public static void ReloadConfig()
@@ -340,11 +290,16 @@ public static partial class TagExtensions
         var players = Instance.PlayerManager.GetAllPlayers();
         foreach (IPlayer player in players)
         {
-            if (player == null || !player.IsValid || player.IsFakeClient || player.SteamID == 0)
+            if (player == null || !player.IsValid || player.IsFakeClient)
                 continue;
 
-            Tag tag = GetOrCreatePlayerTag(player, true);
-            player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
+            try
+            {
+                if (player.SteamID == 0) continue;
+                Tag tag = GetOrCreatePlayerTag(player, true);
+                player.SetScoreTag(player.GetVisibility() ? tag.ScoreTag : Tags.Config.Default.ScoreTag);
+            }
+            catch {}
         }
     }
-} 
+}
